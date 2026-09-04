@@ -1,0 +1,436 @@
+// ============================================================================
+// PharmaPilot AI — Prisma Schema
+// PostgreSQL. Every relation that scopes access (userId / organizationId)
+// is enforced again in application code — never trust the client for these.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  USER
+  PRO
+  ORG_ADMIN
+  SUPER_ADMIN
+}
+
+enum PlanTier {
+  FREE
+  PRO
+  PROFESSIONAL
+  ENTERPRISE
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  TRIALING
+  PAST_DUE
+  CANCELED
+  INCOMPLETE
+}
+
+enum DocumentStatus {
+  PENDING
+  SCANNING
+  PROCESSING
+  READY
+  FAILED
+  REJECTED
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+enum ModuleType {
+  CHAT
+  MEDICINE_INTELLIGENCE
+  RESEARCH_ASSISTANT
+  MEDICAL_WRITING
+  REGULATORY_AI
+  PHARMACOVIGILANCE
+  DATA_ANALYST
+  PDF_INTELLIGENCE
+}
+
+enum AuditAction {
+  USER_LOGIN
+  USER_LOGOUT
+  USER_SIGNUP
+  PASSWORD_CHANGE
+  PASSWORD_RESET_REQUEST
+  PASSWORD_RESET_COMPLETE
+  MFA_ENABLED
+  MFA_DISABLED
+  ROLE_CHANGE
+  ACCOUNT_SUSPENDED
+  ACCOUNT_REACTIVATED
+  ORG_CREATED
+  ORG_MEMBER_ADDED
+  ORG_MEMBER_REMOVED
+  DOCUMENT_UPLOADED
+  DOCUMENT_DELETED
+  SUBSCRIPTION_CHANGED
+  ADMIN_ACTION
+  SESSION_REVOKED
+}
+
+enum SecurityEventSeverity {
+  INFO
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum SecurityEventType {
+  FAILED_LOGIN
+  ACCOUNT_LOCKOUT
+  RATE_LIMIT_EXCEEDED
+  SUSPICIOUS_UPLOAD
+  IDOR_ATTEMPT
+  INVALID_SESSION
+  CSRF_FAILURE
+  PROMPT_INJECTION_DETECTED
+  PRIVILEGE_ESCALATION_ATTEMPT
+}
+
+// ---------------------------------------------------------------------------
+// Identity & Access
+// ---------------------------------------------------------------------------
+
+model User {
+  id                  String    @id @default(cuid())
+  email               String    @unique
+  emailVerified       DateTime?
+  passwordHash        String? // null when user only uses OAuth
+  name                String?
+  avatarUrl           String?
+  role                Role      @default(USER)
+  mfaEnabled          Boolean   @default(false)
+  mfaSecretEncrypted  String? // encrypted at rest, never returned to client
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+  isSuspended         Boolean   @default(false)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  sessions          Session[]
+  oauthAccounts     OAuthAccount[]
+  memberships       Membership[]
+  conversations     Conversation[]
+  documents         Document[]
+  savedAnswers      SavedAnswer[]
+  usageRecords      UsageRecord[]
+  subscription      Subscription?
+  notifications     Notification[]
+  auditLogsActor    AuditLog[]        @relation("AuditActor")
+  auditLogsTarget   AuditLog[]        @relation("AuditTarget")
+  securityEvents    SecurityEvent[]
+  passwordResets    PasswordResetToken[]
+  emailVerifications EmailVerificationToken[]
+
+  @@index([email])
+}
+
+model OAuthAccount {
+  id                String   @id @default(cuid())
+  userId            String
+  provider          String // e.g. "google"
+  providerAccountId String
+  createdAt         DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+// Server-side session store — enables true revocation ("logout all devices"),
+// unlike a purely stateless JWT.
+model Session {
+  id            String   @id @default(cuid())
+  userId        String
+  tokenHash     String   @unique // sha-256 of the opaque session token; raw token never stored
+  userAgent     String?
+  ipAddress     String?
+  createdAt     DateTime @default(now())
+  lastActiveAt  DateTime @default(now())
+  expiresAt     DateTime
+  revokedAt     DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model EmailVerificationToken {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Organizations
+// ---------------------------------------------------------------------------
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships   Membership[]
+  subscription  Subscription?
+  documents     Document[]
+  auditLogs     AuditLog[]
+
+  @@index([slug])
+}
+
+model Membership {
+  id             String   @id @default(cuid())
+  userId         String
+  organizationId String
+  role           Role     @default(USER) // org-scoped role
+  createdAt      DateTime @default(now())
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+}
+
+// ---------------------------------------------------------------------------
+// AI Chat
+// ---------------------------------------------------------------------------
+
+model Conversation {
+  id          String     @id @default(cuid())
+  userId      String
+  module      ModuleType @default(CHAT)
+  title       String     @default("New Chat")
+  isArchived  Boolean    @default(false)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  @@index([userId])
+}
+
+model Message {
+  id             String      @id @default(cuid())
+  conversationId String
+  role           MessageRole
+  content        String      @db.Text
+  // raw model/provider output kept separately from sanitized content shown to user
+  providerMeta   Json?
+  createdAt      DateTime    @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  citations    Citation[]
+
+  @@index([conversationId])
+}
+
+model SavedAnswer {
+  id        String   @id @default(cuid())
+  userId    String
+  title     String
+  content   String   @db.Text
+  module    ModuleType
+  createdAt DateTime @default(now())
+
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  citations Citation[]
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Documents & RAG
+// ---------------------------------------------------------------------------
+
+model Document {
+  id              String         @id @default(cuid())
+  userId          String
+  organizationId  String?
+  fileName        String // sanitized display name
+  storageKey      String // opaque key in object storage — never a client-controlled path
+  mimeType        String
+  sizeBytes       Int
+  status          DocumentStatus @default(PENDING)
+  malwareScanResult Json? // { clean: boolean, engine: string, scannedAt }
+  pageCount       Int?
+  errorMessage    String?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  user         User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization?   @relation(fields: [organizationId], references: [id])
+  chunks       DocumentChunk[]
+
+  @@index([userId])
+  @@index([organizationId])
+}
+
+model DocumentChunk {
+  id         String   @id @default(cuid())
+  documentId String
+  chunkIndex Int
+  content    String   @db.Text
+  // embedding stored via pgvector extension in production migration;
+  // represented here as Unsupported type placeholder
+  embedding  Unsupported("vector(1536)")?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  document  Document   @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  citations Citation[]
+
+  @@index([documentId])
+  @@unique([documentId, chunkIndex])
+}
+
+// A citation always points to a concrete source: either a retrieved document
+// chunk or an external web result — never a bare model claim.
+model Citation {
+  id              String   @id @default(cuid())
+  messageId       String?
+  savedAnswerId   String?
+  documentChunkId String?
+  sourceType      String // "document" | "web"
+  title           String
+  publisher       String?
+  url             String?
+  publishedAt     DateTime?
+  createdAt       DateTime @default(now())
+
+  message       Message?       @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  savedAnswer   SavedAnswer?   @relation(fields: [savedAnswerId], references: [id], onDelete: Cascade)
+  documentChunk DocumentChunk? @relation(fields: [documentChunkId], references: [id])
+
+  @@index([messageId])
+  @@index([savedAnswerId])
+}
+
+// ---------------------------------------------------------------------------
+// Usage, Billing, Notifications
+// ---------------------------------------------------------------------------
+
+model UsageRecord {
+  id        String     @id @default(cuid())
+  userId    String
+  module    ModuleType
+  tokensIn  Int        @default(0)
+  tokensOut Int        @default(0)
+  createdAt DateTime   @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+}
+
+model Subscription {
+  id                   String             @id @default(cuid())
+  userId               String?            @unique
+  organizationId       String?            @unique
+  plan                 PlanTier           @default(FREE)
+  status               SubscriptionStatus @default(ACTIVE)
+  paymentProviderId    String? // opaque customer/subscription id from payment provider
+  currentPeriodEnd     DateTime?
+  cancelAtPeriodEnd    Boolean            @default(false)
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+
+  user         User?         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  title     String
+  body      String
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+}
+
+// ---------------------------------------------------------------------------
+// Audit & Security
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id             String       @id @default(cuid())
+  action         AuditAction
+  actorUserId    String?
+  targetUserId   String?
+  organizationId String?
+  metadata       Json?
+  ipAddress      String?
+  createdAt      DateTime     @default(now())
+
+  actor        User?         @relation("AuditActor", fields: [actorUserId], references: [id])
+  target       User?         @relation("AuditTarget", fields: [targetUserId], references: [id])
+  organization Organization? @relation(fields: [organizationId], references: [id])
+
+  @@index([actorUserId])
+  @@index([createdAt])
+}
+
+model SecurityEvent {
+  id        String                 @id @default(cuid())
+  type      SecurityEventType
+  severity  SecurityEventSeverity  @default(LOW)
+  userId    String?
+  ipAddress String?
+  userAgent String?
+  details   Json?
+  createdAt DateTime               @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([type])
+  @@index([createdAt])
+}
